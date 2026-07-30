@@ -1,6 +1,6 @@
 # Data Extractor (Extraction Engine v2.0)
 
-A high-performance, professional-grade desktop automation system designed for high-volume data extraction from the MCA portal. This system features a premium React dashboard, robust process management, and advanced security protocols.
+A high-performance, professional-grade desktop automation system designed for high-volume data extraction from the data portal. This system features a premium React dashboard, robust process management, and advanced security protocols.
 
 ![Dashboard Preview](assets/dashboard_preview.png)
 
@@ -24,7 +24,7 @@ A high-performance, professional-grade desktop automation system designed for hi
 
 ## 📂 Project Structure
 
-*   `MCA_Portable_App/`: The standalone, client-ready version of the application.
+*   `data_Portable_App/`: The standalone, client-ready version of the application.
 *   `frontend/`: Source code for the React dashboard.
 *   `api.py`: FastAPI backend coordinator.
 *   `scraper.py`: Core extraction engine.
@@ -32,8 +32,8 @@ A high-performance, professional-grade desktop automation system designed for hi
 
 ## 🏁 Quick Start (Portable Mode)
 
-1.  Navigate to the `MCA_Portable_App/` directory.
-2.  Double-click `Start_MCA_Engine.bat`.
+1.  Navigate to the `data_Portable_App/` directory.
+2.  Double-click `Start_data_Engine.bat`.
 3.  The dashboard will automatically open in your default browser at `http://localhost:8000`.
 
 ## 👨‍💻 Development Setup
