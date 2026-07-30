@@ -1,4 +1,4 @@
-# Companies Data Extractor (MCA Extraction Engine v2.0)
+# Data Extractor (Extraction Engine v2.0)
 
 A high-performance, professional-grade desktop automation system designed for high-volume data extraction from the MCA portal. This system features a premium React dashboard, robust process management, and advanced security protocols.
 
