@@ -5,13 +5,9 @@ __pycache__/
 venv/
 .env
 
-# Node
-node_modules/
-dist/
-dist-ssr
-*.local
-
 # Scraper Data
+logs/
+*.log
 input/
 output/
 *.xlsx

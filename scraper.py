@@ -8,11 +8,36 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests
 import threading
 import config
+import subprocess
 import logging
 from logging.handlers import RotatingFileHandler
 
 # Use the centralized logger configured in api.py
 logger = logging.getLogger(__name__)
+
+def check_vpn_active():
+    """Returns True if a VPN connection is detected via Windows network adapters."""
+    try:
+        # Check built in VPN
+        cmd_vpn = ["powershell", "-Command", "Get-VpnConnection -ErrorAction SilentlyContinue | Where-Object { $_.ConnectionStatus -eq 'Connected' }"]
+        res = subprocess.run(cmd_vpn, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        if res.stdout.strip():
+            return True
+        
+        # Check network adapters
+        keywords = "'Proton|WireGuard|TUN|TAP'"
+        cmd_adapter = ["powershell", "-Command", f"Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ $_.Status -eq 'Up' -and ($_.InterfaceDescription -match {keywords} -or $_.Name -match {keywords}) }} | Select-Object -ExpandProperty Name"]
+        res2 = subprocess.run(cmd_adapter, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        
+        detected = res2.stdout.strip()
+        if detected:
+            print(f"[KillSwitch] VPN detected on: {detected}")
+            return True
+        return False
+    except Exception as e:
+        # If the check fails, we MUST return False to stop the scraper for safety
+        print(f"[KillSwitch] Error checking VPN status: {e}")
+        return False
 
 def interruptible_sleep(seconds, stop_event):
     """Sleeps for the given duration but checks the stop_event every second."""
@@ -51,8 +76,12 @@ def get_input_data(input_file):
     # Find the row that contains the 'CIN' header
     header_row = None
     for i, row in df.iterrows():
-        if any("CIN" in str(cell).upper() for cell in row):
-            header_row = i
+        for cell in row:
+            val = str(cell).strip().upper()
+            if val == "CIN" or val.startswith("CIN ") or val in ["CIN NO", "CIN NO.", "CIN NUMBER", "LLPIN", "FCRN"]:
+                header_row = i
+                break
+        if header_row is not None:
             break
 
     if header_row is None:
@@ -65,7 +94,7 @@ def get_input_data(input_file):
     return df, header_row
 
 
-def scrape_mca_data(session, cin, log_callback=None):
+def scrape_company_data(session, cin, log_callback=None):
     """
     Main extraction function for a single CIN.
     It scrapes the main overview page and the directors sub-page.
@@ -77,14 +106,17 @@ def scrape_mca_data(session, cin, log_callback=None):
         return {"CIN": cin, "Company Name": "NA", "Status": "Incorrect Format"}
 
     if log_callback:
-        logger.info(f"Fetching {cin} from MCA...")
-        log_callback(f"[Go] Fetching {cin} from MCA...")
+        log_callback(f"[Go] Fetching {cin} from Source...")
     else:
-        logger.info(f"Fetching {cin} from MCA...")
+        print(f"\n[Go] Fetching {cin} from Source...")
 
     # Initialize data dictionary with default 'NA' values
     data = {k: "NA" for k in FIELDS}
     data["CIN"] = cin
+
+    # Aggressive Kill Switch Check
+    if not check_vpn_active():
+        raise Exception("VPN_LOST")
 
     # -------------------------------------------------------------
     # 0. Resolve the Official URL via Search Handler
@@ -120,7 +152,7 @@ def scrape_mca_data(session, cin, log_callback=None):
     try:
         r = session.get(target_url, headers=headers, timeout=15)
         if r.status_code != 200:
-            logger.error(f"Failed to fetch {cin} (Status Code: {r.status_code})")
+            print(f"[!] Failed to fetch (Status Code: {r.status_code})")
             return data
 
         soup = BeautifulSoup(r.text, 'html.parser')
@@ -249,14 +281,14 @@ def scrape_mca_data(session, cin, log_callback=None):
         return data
 
     except Exception as e:
-         if str(e) == "WAF_Block":
+         if str(e) == "WAF_Block" or str(e) == "VPN_LOST":
              raise e
          print(f"[X] Request Error for {cin}: {e}")
          # Treat raw network/connection errors identically to WAF blocks to trigger the retry loop
          raise Exception("WAF_Block") 
 
 
-def run(input_file=None, output_file=None, delay_range=None, log_callback=None, stop_event=None, progress_callback=None, total=0, pending=0):
+def run(input_file=None, output_file=None, delay_range=None, log_callback=None, stop_event=None, progress_callback=None, metadata_callback=None, total=0, pending=0):
     """
     Main Execution Engine. Handles status tracking, record limits, and incremental saving.
     """
@@ -271,8 +303,12 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
         if progress_callback:
             progress_callback(current, total)
 
+    def update_metadata(total, pending):
+        if metadata_callback:
+            metadata_callback(total, pending)
+
     log("="*60)
-    log("      MCA HIGH-VOLUME DATA EXTRACTION ENGINE      ")
+    log("        COMPANIES DATA EXTRACTION ENGINE        ")
     log("="*60)
 
     if input_file is None or not os.path.exists(input_file):
@@ -286,7 +322,13 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
         return
 
     # Identify CIN column
-    cin_col = next((c for c in df_full.columns if "CIN" in str(c).upper()), None)
+    cin_col = None
+    for c in df_full.columns:
+        val = str(c).strip().upper()
+        if val == "CIN" or val.startswith("CIN ") or val in ["CIN NO", "CIN NO.", "CIN NUMBER", "LLPIN", "FCRN"]:
+            cin_col = c
+            break
+            
     if not cin_col:
         log("[X] CIN column not found.")
         return
@@ -299,16 +341,48 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
         df_full['Extracted Time'] = ""
         df_full.at[header_row, 'Extracted Time'] = "Extracted Time"
 
-    # Records to process are those below header_row
-    data_rows = df_full.index[header_row + 1:]
+    # Identify rows that actually contain a CIN
+    # We filter out empty rows in the CIN column
+    data_df = df_full.iloc[header_row + 1:]
+    valid_data_df = data_df[data_df[cin_col].notna()]
+    valid_data_df = valid_data_df[valid_data_df[cin_col].astype(str).str.strip() != ""]
+    
+    data_rows = valid_data_df.index.tolist()
     total_records = len(data_rows)
     
+    if total_records == 0:
+        log("[!] No valid CIN records found in the selected file.")
+        update_metadata(0, 0)
+        return
+
     if total_records > config.MAX_RECORDS_PER_FILE:
-        log(f"[X] Error: File contains {total_records} records. Please add a file with less than {config.MAX_RECORDS_PER_FILE} records.")
+        log(f"[X] Error: File contains {total_records} valid records. Please add a file with less than {config.MAX_RECORDS_PER_FILE} records.")
         return
 
     log(f"[OK] Total CINs found: {total_records}")
+    
+    # Identify status column index for live pending count
+    status_idx = None
+    # We look for 'Status' in the original columns (which were set from header_row)
+    for idx, col_name in enumerate(df_full.columns):
+        if str(col_name).strip().lower() == 'status':
+            status_idx = idx
+            break
+    
+    # Actual pending count from the file
+    file_pending = total_records
+    if status_idx is not None:
+        # Check status only for valid data rows
+        data_statuses = valid_data_df.iloc[:, status_idx].astype(str).str.strip().str.lower().tolist()
+        exported_count = sum(1 for s in data_statuses if s == "exported")
+        file_pending = total_records - exported_count
 
+    # Notify metadata callback with latest counts
+    update_metadata(total_records, file_pending)
+
+    if pending > 0:
+        log(f"[OK] Records to process: {pending}")
+    
     # Results for the output file
     results = []
     # If output file exists, maybe load existing results? 
@@ -323,7 +397,10 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
 
     session = requests.Session(impersonate="chrome110")
     processed_count = 0
-    update_progress(0, total_records)
+    update_progress(0, pending if pending > 0 else total_records)
+    
+    # Track how many from the pending list we actually finish in THIS session
+    session_target = pending if pending > 0 else total_records
 
     for idx in data_rows:
         if stop_event and stop_event.is_set():
@@ -333,19 +410,20 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
         cin = str(df_full.at[idx, cin_col]).strip()
         if not cin or cin == "nan":
             continue
-
+        
         # Validation Logic: CIN (21 chars, starts with U/L) or LLPIN (7 chars)
         is_valid_cin = len(cin) == 21 and cin[0].upper() in ['U', 'L']
         is_valid_llpin = len(cin) == 7
         
         if not (is_valid_cin or is_valid_llpin):
+            logger.warning(f"Skipping {cin} - Incorrect Format")
             log(f"[Skip] '{cin}' -> Incorrect Format")
             df_full.at[idx, 'Status'] = "Incorrect Format"
             df_full.at[idx, 'Extracted Time'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 df_full.to_excel(input_file, index=False, header=False)
                 processed_count += 1
-                update_progress(processed_count, total_records)
+                update_progress(processed_count, session_target)
             except: pass
             continue
 
@@ -360,19 +438,24 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
 
         while attempts < 3:
             try:
-                extracted_data = scrape_mca_data(session, cin, log_callback=log)
+                extracted_data = scrape_company_data(session, cin, log_callback=log)
                 success = True
                 break
             except Exception as e:
+                if str(e) == "VPN_LOST":
+                    logger.critical("CRITICAL: VPN Connection Lost! Aborting extraction.")
+                    log("\n[!!!] VPN LOST DURING EXTRACTION! ABORTING... [!!!]")
+                    if stop_event: stop_event.set()
+                    break
                 attempts += 1
                 if attempts < 3:
-                    logger.warning(f"WAF Block detected for {cin}. Pausing for 30 seconds... (Attempt {attempts}/3)")
+                    logger.warning(f"WAF Block for {cin}. Sleeping 30s. (Attempt {attempts}/3)")
                     log(f"[Refresh] WAF Block detected. Pausing for 30 seconds... (Attempt {attempts}/3)")
                     if interruptible_sleep(30, stop_event):
                         break
                     session = requests.Session(impersonate="chrome110")
                 else:
-                    logger.error(f"Failed to fetch {cin} after 3 attempts.")
+                    logger.error(f"Permanently failed to fetch {cin} after 3 retries.")
                     log(f"[X] Failed to fetch {cin} after 3 attempts.")
                     break
         
@@ -384,11 +467,11 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
             logger.info(f"Successfully exported {cin}")
             log(f"[Save] {cin} -> Exported")
         else:
+            # If we reached here, the format was correct but the data fetch failed
             df_full.at[idx, 'Status'] = "Extraction Failed"
             df_full.at[idx, 'Extracted Time'] = current_time
-            logger.error(f"Failed to export {cin} (Extraction Failed)")
-            log(f"[Fail] {cin} -> Extraction Failed")
-
+            log(f"[Fail] {cin} -> Extraction Failed (Data not yet available or Source Error)")
+ 
         # Save both files incrementally
         try:
             # Save Input File (Status update)
@@ -399,19 +482,20 @@ def run(input_file=None, output_file=None, delay_range=None, log_callback=None, 
             # Save Output File
             pd.DataFrame(results).to_excel(output_file, index=False)
             processed_count += 1
-            update_progress(processed_count, total_records)
+            update_progress(processed_count, session_target)
         except Exception as e:
-            logger.error(f"File Save Error: {e}")
             log(f"[!] Warning: Could not save files (maybe they are open in Excel?): {e}")
 
         # Random delay between delay_min and delay_max seconds
         delay = random.uniform(delay_range[0], delay_range[1])
-        logger.info(f"Sleeping for {int(delay)}s...")
         log(f"[Wait] Next extraction in {int(delay)}s...")
         if interruptible_sleep(delay, stop_event):
             break
 
-    log(f"\n[OK] SCRAPE PROCESS FINISHED.")
+    if stop_event and stop_event.is_set():
+        log(f"\n[Wait] Extraction stopped by the user.")
+    else:
+        log(f"\n[OK] Extraction was finished.")
 
 if __name__ == "__main__":
     # For testing purposes only

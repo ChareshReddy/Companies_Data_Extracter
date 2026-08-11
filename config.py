@@ -1,5 +1,5 @@
 # ==========================================
-# MCA EXTRACTION ENGINE - CONFIGURATION FILE
+# COMPANIES DATA EXTRACTION ENGINE - CONFIGURATION FILE
 # ==========================================
 # You can modify these values to adjust how the engine behaves.
 # You MUST restart the engine after making changes here.

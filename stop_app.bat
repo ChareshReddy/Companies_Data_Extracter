@@ -1,30 +1,12 @@
 @echo off
-cd /d "%~dp0"
-
+title Stop Companies Data Extraction Engine
 echo ===================================================
-echo           STOPPING APPLICATION PROCESSES
+echo           COMPANIES DATA EXTRACTION ENGINE - SHUTDOWN
 echo ===================================================
-
 echo.
-echo Stopping Python backend processes...
-taskkill /F /IM python.exe /T 2>nul
-if %errorlevel% equ 0 (
-    echo [SUCCESS] Python processes terminated.
-) else (
-    echo [INFO] No running python processes found.
-)
-
+echo Force stopping all background scraper processes...
+taskkill /F /IM python.exe /T >nul 2>&1
 echo.
-echo Stopping Node.js/Frontend processes...
-taskkill /F /IM node.exe /T 2>nul
-if %errorlevel% equ 0 (
-    echo [SUCCESS] Node.js processes terminated.
-) else (
-    echo [INFO] No running node processes found.
-)
-
-echo.
-echo ===================================================
-echo Application stopped successfully.
-echo ===================================================
+echo Server successfully stopped!
+echo You can now close this window.
 pause

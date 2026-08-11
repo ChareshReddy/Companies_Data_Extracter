@@ -14,6 +14,7 @@ import scraper
 import time
 import ctypes
 import config
+import subprocess
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -37,7 +38,28 @@ def setup_app_logging():
     return logging.getLogger(__name__)
 
 logger = setup_app_logging()
-logger.info("Application Startup - Logging Initialized")
+logger.info("Companies Data Extractor Startup - Logging Initialized")
+
+def check_vpn_active():
+    try:
+        cmd_vpn = ["powershell", "-Command", "Get-VpnConnection -ErrorAction SilentlyContinue | Where-Object { $_.ConnectionStatus -eq 'Connected' }"]
+        res = subprocess.run(cmd_vpn, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        if res.stdout.strip(): 
+            return True
+        
+        keywords = "'Proton|WireGuard|TUN|TAP'"
+        cmd_adapter = ["powershell", "-Command", f"Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ $_.Status -eq 'Up' -and ($_.InterfaceDescription -match {keywords} -or $_.Name -match {keywords}) }} | Select-Object -ExpandProperty Name"]
+        res2 = subprocess.run(cmd_adapter, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        
+        detected = res2.stdout.strip()
+        if detected:
+            # For debugging, we'll print it to the console
+            # print(f"[Debug] VPN Detected via Adapter: {detected}")
+            return True
+        return False
+    except Exception as e:
+        print(f"[KillSwitch] Error checking VPN status: {e}")
+        return False
 
 def get_resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -107,6 +129,15 @@ def monitor_heartbeat():
             last_heartbeat = current_time # Reset heartbeat to prevent immediate shutdown
             
         last_check_time = current_time
+
+        # LIVE VPN KILL SWITCH - Instant background check every 5 seconds
+        if scraper_state["is_running"]:
+            if not check_vpn_active():
+                msg = "[!!!] CRITICAL SECURITY ALERT: VPN DISCONNECTED! [!!!]"
+                print(f"\n\n{msg}")
+                scraper_state["logs"].append(msg)
+                scraper_state["logs"].append("[!!!] The extraction has been automatically aborted to protect your real IP address.")
+                stop_event.set()
 
         if first_heartbeat_received:
             if disconnect_received:
@@ -185,8 +216,7 @@ def run_scraper_background(input_path: str, output_path: str, delay_min: int, de
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    # os.makedirs("input", exist_ok=True)
-    pass
+    os.makedirs("input", exist_ok=True)
     file_path = f"input/{file.filename}"
     content = await file.read()
     with open(file_path, "wb") as f:
@@ -198,8 +228,12 @@ async def upload_file(file: UploadFile = File(...)):
         # Find header row
         header_row = None
         for i, row in df.iterrows():
-            if any("CIN" in str(cell).upper() for cell in row):
-                header_row = i
+            for cell in row:
+                val = str(cell).strip().upper()
+                if val == "CIN" or val.startswith("CIN ") or val in ["CIN NO", "CIN NO.", "CIN NUMBER", "LLPIN", "FCRN"]:
+                    header_row = i
+                    break
+            if header_row is not None:
                 break
         
         if header_row is None:
@@ -219,7 +253,7 @@ async def upload_file(file: UploadFile = File(...)):
         pending_count = total_records
         if 'Status' in df.columns:
             statuses = df['Status'].iloc[header_row+1:].astype(str).str.strip().tolist()
-            exported_count = sum(1 for s in statuses if s in ["Exported", "Incorrect Format"])
+            exported_count = sum(1 for s in statuses if s == "Exported")
             pending_count = total_records - exported_count
 
         return {
@@ -250,22 +284,21 @@ def select_input_path():
         file_path = result.stdout.strip()
         
         if file_path:
-            file_ext = os.path.splitext(file_path)[1].lower()
-            if file_ext not in ['.xlsx', '.xls']:
-                return JSONResponse(status_code=400, content={"message": "INVALID FILE TYPE: Please select a valid Excel file (.xlsx or .xls)"})
-            
             logger.info(f"User selected input file: {file_path}")
             # Get record count and metadata
             try:
                 df = pd.read_excel(file_path, header=None)
                 header_row = None
                 for i, row in df.iterrows():
-                    if any("CIN" in str(cell).upper() for cell in row):
-                        header_row = i
+                    for cell in row:
+                        val = str(cell).strip().upper()
+                        if val == "CIN" or val.startswith("CIN ") or val in ["CIN NO", "CIN NO.", "CIN NUMBER", "LLPIN", "FCRN"]:
+                            header_row = i
+                            break
+                    if header_row is not None:
                         break
                 
                 if header_row is None:
-                    logger.error(f"Failed to read input file (missing CIN): {file_path}")
                     return JSONResponse(status_code=400, content={"message": "Could not find 'CIN' column in the selected file."})
                 
                 # Identify CIN column index
@@ -286,37 +319,49 @@ def select_input_path():
                 total_records = len(data_df)
                 
                 if total_records > config.MAX_RECORDS_PER_FILE:
-                    logger.warning(f"File exceeds record limit: {total_records} records.")
                     return JSONResponse(status_code=400, content={
                         "message": f"File contains {total_records} records. Please add a file with less than {config.MAX_RECORDS_PER_FILE} records.",
                         "total": total_records
                     })
 
                 # Calculate pending records
+                # Ensure we handle duplicate columns by using unique names if needed
+                df_temp = df.copy()
+                df_temp.columns = [str(c).strip() for c in df.iloc[header_row]]
+                print(f"[DEBUG] Found Columns: {list(df_temp.columns)}")
+                
                 pending_count = total_records
-                # Identify status column index
-                status_idx = None
-                for idx, col_name in enumerate(df.iloc[header_row]):
-                    if str(col_name).strip().lower() == 'status':
-                        status_idx = idx
+                # Look for 'Status' column specifically
+                status_col = None
+                for col in df_temp.columns:
+                    if str(col).strip().lower() == 'status':
+                        status_col = col
                         break
                 
-                if status_idx is not None:
-                    data_statuses = data_df[status_idx].astype(str).str.strip().str.lower().tolist()
-                    exported_count = sum(1 for s in data_statuses if s == "exported")
-                    pending_count = total_records - exported_count
+                if status_col is not None:
+                    # Get statuses from the filtered data_df
+                    # Find which index in df.iloc[header_row] corresponds to status_col
+                    status_idx = None
+                    for idx, col_name in enumerate(df.iloc[header_row]):
+                        if str(col_name).strip().lower() == 'status':
+                            status_idx = idx
+                            break
+                    
+                    if status_idx is not None:
+                        data_statuses = data_df[status_idx].astype(str).str.strip().str.lower().tolist()
+                        exported_count = sum(1 for s in data_statuses if s == "exported")
+                        pending_count = total_records - exported_count
+                    
                     print(f"[DEBUG] Records: Total={total_records}, Exported={exported_count}, Pending={pending_count}")
-                
-                if pending_count == 0:
-                    scraper_state["logs"].append("[OK] This file appears to be fully processed already.")
-                
+
                 scraper_state["input_file"] = file_path
+                scraper_state["output_file"] = None
                 scraper_state["total"] = total_records
                 scraper_state["pending"] = pending_count
                 scraper_state["progress"] = 0
                 scraper_state["logs"] = []
                 scraper_state["error"] = None
-                
+
                 return {
                     "path": file_path, 
                     "total": total_records,
@@ -362,27 +407,6 @@ def select_output_path(input_filename: str):
         print(f"Isolated picker error: {e}")
         return JSONResponse(status_code=500, content={"message": "Failed to open save dialog."})
 
-@app.get("/open-file")
-def open_file(path: str):
-    if not os.path.exists(path):
-        return JSONResponse(status_code=404, content={"message": "File not found"})
-    try:
-        os.startfile(path)
-        return {"message": "Success"}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"message": str(e)})
-
-@app.get("/open-folder")
-def open_folder(path: str):
-    folder = os.path.dirname(path)
-    if not os.path.exists(folder):
-        return JSONResponse(status_code=404, content={"message": "Folder not found"})
-    try:
-        os.startfile(folder)
-        return {"message": "Success"}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"message": str(e)})
-
 @app.post("/start")
 async def start_scraping(background_tasks: BackgroundTasks, input_file: str, output_path: str = Query(...), total: int = 0, pending: int = 0):
     if scraper_state["is_running"]:
@@ -423,8 +447,55 @@ async def download_results():
     return FileResponse(
         scraper_state["output_file"], 
         media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        filename="MCA_Data_Extracter_Results.xlsx"
+        filename="Companies_Data_Results.xlsx"
     )
+
+@app.get("/open-file")
+async def open_file(path: str = Query(...)):
+    try:
+        norm_path = os.path.abspath(os.path.normpath(path))
+        print(f"[UI] Opening File: {norm_path}")
+        if not os.path.exists(norm_path):
+            return JSONResponse(status_code=404, content={"message": "File not found. It will be created once the first record is extracted."})
+        
+        # Use ShellExecute via PowerShell, which is the most reliable way to force focus
+        import subprocess
+        cmd = f'powershell -Command "(New-Object -ComObject Shell.Application).ShellExecute(\'{norm_path}\')"'
+        subprocess.Popen(cmd, shell=True)
+        return {"status": "success"}
+    except Exception as e:
+        print(f"[ERROR] Could not open file: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+@app.get("/open-folder")
+async def open_folder(path: str = Query(...)):
+    try:
+        norm_path = os.path.abspath(os.path.normpath(path))
+        print(f"[UI] Opening Folder (VBS Trick): {norm_path}")
+        
+        if not os.path.exists(norm_path):
+            return JSONResponse(status_code=404, content={"message": "File not found."})
+
+        # The VBScript 'AppActivate' trick is the most powerful way to bypass foreground locks.
+        import tempfile
+        vbs_content = f'''
+Set objShell = CreateObject("Wscript.Shell")
+objShell.Run "explorer.exe /select,""{norm_path}"""
+WScript.Sleep 1000
+objShell.AppActivate "File Explorer"
+'''
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".vbs") as f:
+            f.write(vbs_content.encode('utf-8'))
+            vbs_path = f.name
+            
+        import subprocess
+        subprocess.Popen(['wscript.exe', vbs_path])
+        
+        # We don't delete immediately to give wscript time to read it
+        return {"status": "success"}
+    except Exception as e:
+        print(f"[ERROR] Could not open folder: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 # Mount the React frontend (at the end so it doesn't override API routes)
 frontend_path = get_resource_path("frontend/dist")
